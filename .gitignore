@@ -4,3 +4,10 @@ __pycache__/
 .ipynb_checkpoints/
 data/*.parquet
 data/*.csv
+data/kalshi/
+data/polymarket/
+data.tar
+data.tar.zst
+notebooks/executed.ipynb
+.claude/
+__pycache__/

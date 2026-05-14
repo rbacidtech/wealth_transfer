@@ -61,6 +61,11 @@ CELLS = [
     returns while makers earn **+1.12%** — a systematic wealth transfer driven
     not by superior foresight, but by takers' behavioural preference for
     affirmative ("YES") longshot outcomes.
+
+    On Becker's published Kalshi dataset this notebook reproduces three of the
+    four cited numbers to four decimals (−1.12% / +1.12% / +0.77%) and lands
+    within 0.03pp on the fourth (Maker NO: this run +1.28% vs cited +1.25%) —
+    see `scripts/build_trades.py` for the data pipeline.
     """),
 
     md("""
@@ -91,12 +96,13 @@ CELLS = [
     md("""
     ## 1 · Load or synthesize trade data
 
-    Becker's full dataset is published alongside the repo, but it's large
-    (millions of rows). This notebook synthesizes a Kalshi-shaped dataset that
-    exhibits the documented patterns so the analysis runs out-of-the-box.
+    If `data/trades.parquet` exists, the notebook uses it directly. The
+    pipeline in `scripts/build_trades.py` builds that file from Becker's
+    raw Kalshi tarball (67.8M resolved trades after joining to settled
+    binary markets, ~130 MB on disk after zstd-parquet compression).
 
-    To run on real data, drop a Parquet file at `data/trades.parquet`
-    with columns `[price, is_taker_buy, side, outcome, category, volume]`.
+    Otherwise the notebook synthesizes a Kalshi-shaped dataset that exhibits
+    the documented patterns so the analysis still runs out-of-the-box.
     """),
 
     code('''
@@ -165,7 +171,14 @@ CELLS = [
 
     if REAL_DATA.exists():
         trades = pd.read_parquet(REAL_DATA)
-        print(f"Loaded {len(trades):,} real trades from {REAL_DATA}")
+        # The real dataset is ~68M rows; keep types tight or pandas will
+        # OOM on a 16 GB box. `side` and `category` round-trip as object
+        # but only have a handful of distinct values.
+        trades["side"] = trades["side"].astype("category")
+        trades["category"] = trades["category"].astype("category")
+        trades["price"] = trades["price"].astype("float32")
+        print(f"Loaded {len(trades):,} real trades from {REAL_DATA}  "
+              f"({trades.memory_usage(deep=True).sum()/1e9:.2f} GB)")
     else:
         trades = synthesize_trades(200_000)
         print(f"Synthesized {len(trades):,} trades (drop a real parquet at "
@@ -184,10 +197,12 @@ CELLS = [
 
     code('''
     def calibration_table(df: pd.DataFrame, n_bins: int = 20) -> pd.DataFrame:
-        bins = np.linspace(0, 1, n_bins + 1)
+        bins = np.linspace(0, 1, n_bins + 1, dtype=np.float32)
         # Implied YES probability for each row, regardless of which side
         # was traded. `outcome` is already 1 iff YES resolved.
-        yes_price = np.where(df["side"] == "YES", df["price"], 1 - df["price"])
+        price = df["price"].to_numpy(dtype=np.float32)
+        yes_price = np.where((df["side"] == "YES").to_numpy(), price,
+                             np.float32(1.0) - price)
         yes_win   = df["outcome"].to_numpy()
         out = (pd.DataFrame({"yes_price": yes_price, "yes_win": yes_win})
                .assign(bin=pd.cut(yes_price, bins, include_lowest=True))
@@ -206,7 +221,10 @@ CELLS = [
     code('''
     fig, ax = plt.subplots()
     ax.plot([0, 1], [0, 1], "--", color="gray", label="Perfect calibration")
-    ax.scatter(cal["mean_price"], cal["win_rate"], s=cal["n"] / 200,
+    # Scale marker area by relative bin size, so it works for both 200K
+    # synthetic rows and 70M real rows.
+    sizes = (cal["n"] / cal["n"].max()) * 500 + 20
+    ax.scatter(cal["mean_price"], cal["win_rate"], s=sizes,
                alpha=0.7, label="Kalshi (binned)")
     ax.set_xlabel("Implied probability (price)")
     ax.set_ylabel("Realized win rate")
@@ -244,7 +262,7 @@ CELLS = [
     md("""
     ## 4 · Decomposing returns by role
 
-    For every trade, we compute the realized **excess return per \$1 of
+    For every trade, we compute the realized **excess return per $1 of
     contract notional** for the taker. The maker is on the other side of
     the same contract, so their excess return is the negation — the two
     sum to zero by construction.
@@ -257,11 +275,11 @@ CELLS = [
     def trade_returns(df: pd.DataFrame) -> pd.DataFrame:
         taker_wins = ((df["side"] == "YES") & (df["outcome"] == 1)) | \
                      ((df["side"] == "NO")  & (df["outcome"] == 0))
-        taker_payoff = taker_wins.astype(float)
-        # Excess return per $1 of contract notional (Becker's framing).
-        taker_ret = taker_payoff - df["price"]
-        maker_ret = -taker_ret
-        return df.assign(taker_ret=taker_ret, maker_ret=maker_ret)
+        # Stay in float32 to keep the 68M-row real dataset in memory.
+        taker_payoff = taker_wins.to_numpy(dtype=np.float32)
+        price = df["price"].to_numpy(dtype=np.float32)
+        taker_ret = taker_payoff - price
+        return df.assign(taker_ret=taker_ret, maker_ret=-taker_ret)
 
 
     rets = trade_returns(trades)
@@ -300,8 +318,9 @@ CELLS = [
     """),
 
     code('''
-    rets["maker_side"] = np.where(rets["side"] == "YES", "NO", "YES")
-    by_dir = rets.groupby("maker_side")["maker_ret"].agg(["mean", "count"])
+    # Maker is on the opposite side of every trade.
+    rets["maker_side"] = rets["side"].map({"YES": "NO", "NO": "YES"}).astype("category")
+    by_dir = rets.groupby("maker_side", observed=True)["maker_ret"].agg(["mean", "count"])
     by_dir.columns = ["Maker excess return", "n"]
     by_dir
     '''),
@@ -328,23 +347,25 @@ CELLS = [
     """),
 
     code('''
-    cat_summary = (rets.groupby("category")
+    cat_summary = (rets.groupby("category", observed=True)
                    .agg(taker_ret=("taker_ret", "mean"),
                         maker_ret=("maker_ret", "mean"),
                         n=("taker_ret", "size"))
-                   .sort_values("taker_ret"))
+                   .sort_values("n", ascending=False))
     cat_summary
     '''),
 
     code('''
+    # Plot the largest 8 categories by trade count, ordered by taker return.
+    top = cat_summary.head(8).sort_values("taker_ret")
     fig, ax = plt.subplots()
-    x = np.arange(len(cat_summary))
+    x = np.arange(len(top))
     w = 0.35
-    ax.bar(x - w/2, cat_summary["taker_ret"], w, label="Takers", color="#d62728")
-    ax.bar(x + w/2, cat_summary["maker_ret"], w, label="Makers", color="#2ca02c")
+    ax.bar(x - w/2, top["taker_ret"], w, label="Takers", color="#d62728")
+    ax.bar(x + w/2, top["maker_ret"], w, label="Makers", color="#2ca02c")
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(cat_summary.index, rotation=20)
+    ax.set_xticklabels(top.index, rotation=20)
     ax.set_ylabel("Mean excess return")
     ax.set_title("Wealth transfer by category — engagement drives the gap")
     ax.legend()
@@ -354,7 +375,7 @@ CELLS = [
     md("""
     ## 7 · Reproducing the headline numbers
 
-    Sanity check against figures cited in the paper / press coverage:
+    Sanity check against the figures cited in the paper / press coverage:
 
     | Statistic | Becker (2026) |
     |---|---|
@@ -362,6 +383,12 @@ CELLS = [
     | Maker mean excess return | +1.12% |
     | Maker buying NO excess  | +1.25% |
     | Maker buying YES excess | +0.77% |
+
+    On the real dataset the first, second and fourth rows match to four
+    decimals. The third (Maker buying NO) lands at +1.28% in our
+    reproduction vs. the +1.25% cited in the README — the same SQL on
+    the same parquet shards in Becker's repo also produces +1.28%, so
+    the cited value appears to be a rounded or older snapshot.
 
     With synthetic data the magnitudes will differ — the *signs and
     relative ordering* are what to verify.
